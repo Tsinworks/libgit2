@@ -32,7 +32,10 @@
 #include "pool.h"
 #include "strmap.h"
 #include "path.h"
+#include "thread.h"
+#include "workerpool.h"
 
+#define ASYNC_CHECKOUT 1
 /* See docs/checkout-internals.md for more information */
 
 enum {
@@ -48,6 +51,13 @@ enum {
 		(CHECKOUT_ACTION__UPDATE_BLOB | CHECKOUT_ACTION__REMOVE)
 };
 
+typedef struct checkout_filter {
+	git_filter_list* filter;
+	const git_diff_file * file;
+	git_str full_path;
+	struct checkout_filter* next;
+} checkout_filter;
+
 typedef struct {
 	git_repository *repo;
 	git_iterator *target;
@@ -56,6 +66,8 @@ typedef struct {
 	bool opts_free_baseline;
 	char *pfx;
 	git_index *index;
+	git_mutex index_mutex;
+	bool index_mutex_inited;
 	git_pool pool;
 	git_vector removes;
 	git_vector remove_conflicts;
@@ -73,8 +85,37 @@ typedef struct {
 	size_t completed_steps;
 	git_checkout_perfdata perfdata;
 	git_strmap *mkdir_map;
+	git_mutex dir_map_pool_mutex;
+	bool dir_map_pool_mutex_inited;
 	git_attr_session attr_session;
+	// .gitattributes resolved to disk
+	bool attr_checked;
+
+	checkout_filter* filters_head;
+	checkout_filter* filters;
 } checkout_data;
+
+#if ASYNC_CHECKOUT
+typedef struct checkout_item {
+	size_t index;
+	checkout_data* data;
+	git_filter_list* filters;
+} checkout_item;
+
+#define access_delta(data, i) (git_diff_delta*)((data)->diff->deltas.contents[(i)])
+
+typedef struct checkout_task {
+	git_thread thread;
+	int start;
+	int end;
+	int error;
+	git_error_state err;
+	checkout_data *data;
+	checkout_item* items;
+	int succeed;
+} checkout_task;
+
+#endif
 
 typedef struct {
 	const git_index_entry *ancestor;
@@ -334,6 +375,20 @@ static int checkout_target_fullpath(
 
 	*out = &data->target_path;
 
+	return 0;
+}
+
+static int
+checkout_target_fullpath_safe(git_str *out, checkout_data *data, const char *path)
+{
+	git_str_init(out, strlen(path) + data->target_len + 3);
+	if (data->target_path.ptr &&
+	    git_str_puts(out, data->target_path.ptr) < 0)
+		return -1;
+	if (path && git_str_puts(out, path) < 0)
+		return -1;
+	if (git_path_validate_str_length(data->repo, out) < 0)
+		return -1;
 	return 0;
 }
 
@@ -1421,14 +1476,21 @@ static int checkout_mkdir(
 
 	mkdir_opts.dir_map = data->mkdir_map;
 	mkdir_opts.pool = &data->pool;
+	mkdir_opts.mutex = &data->dir_map_pool_mutex;
 
+	// not thread safe => add mutex to become thread safe
 	error = git_futils_mkdir_relative(
 		path, base, mode, flags, &mkdir_opts);
 
+#if ASYNC_CHECKOUT
+	git_atomic_ssize_add((git_atomic_ssize*)&data->perfdata.mkdir_calls, mkdir_opts.perfdata.mkdir_calls);
+	git_atomic_ssize_add((git_atomic_ssize*)&data->perfdata.stat_calls, mkdir_opts.perfdata.stat_calls);
+	git_atomic_ssize_add((git_atomic_ssize*)&data->perfdata.chmod_calls, mkdir_opts.perfdata.chmod_calls);
+#else
 	data->perfdata.mkdir_calls += mkdir_opts.perfdata.mkdir_calls;
 	data->perfdata.stat_calls += mkdir_opts.perfdata.stat_calls;
 	data->perfdata.chmod_calls += mkdir_opts.perfdata.chmod_calls;
-
+#endif
 	return error;
 }
 
@@ -1441,14 +1503,17 @@ static int mkpath2file(
 		(remove_existing ? MKDIR_REMOVE_EXISTING : MKDIR_NORMAL) |
 		GIT_MKDIR_SKIP_LAST;
 	int error;
-
+	// not thread safe, will change dir map
 	if ((error = checkout_mkdir(
 			data, path, data->opts.target_directory, mode, flags)) < 0)
 		return error;
 
 	if (remove_existing) {
+		#if ASYNC_CHECKOUT
+		git_atomic_ssize_add((git_atomic_ssize*)&data->perfdata.stat_calls, 1);
+		#else
 		data->perfdata.stat_calls++;
-
+		#endif
 		if (p_lstat(path, &st) == 0) {
 
 			/* Some file, symlink or folder already exists at this name.
@@ -1523,6 +1588,7 @@ static int blob_content_to_file(
 
 	GIT_ASSERT(hint_path != NULL);
 
+	// not thread safe
 	if ((error = mkpath2file(data, path, data->opts.dir_mode)) < 0)
 		return error;
 
@@ -1540,6 +1606,7 @@ static int blob_content_to_file(
 	filter_session.temp_buf = &data->tmp;
 
 	if (!data->opts.disable_filters &&
+	// thread safe, with lock
 		(error = git_filter_list__load(
 			&fl, data->repo, blob, hint_path,
 			GIT_FILTER_TO_WORKTREE, &filter_session))) {
@@ -1566,8 +1633,11 @@ static int blob_content_to_file(
 		return error;
 
 	if (st) {
+		#if ASYNC_CHECKOUT
+		git_atomic_ssize_add((git_atomic_ssize*)&data->perfdata.stat_calls, 1);
+		#else
 		data->perfdata.stat_calls++;
-
+		#endif
 		if ((error = p_stat(path, st)) < 0) {
 			git_error_set(GIT_ERROR_OS, "failed to stat '%s'", path);
 			return error;
@@ -1602,8 +1672,11 @@ static int blob_content_to_link(
 	}
 
 	if (!error) {
+		#if ASYNC_CHECKOUT
+		git_atomic_ssize_add((git_atomic_ssize*)&data->perfdata.stat_calls, 1);
+		#else
 		data->perfdata.stat_calls++;
-
+		#endif
 		if ((error = p_lstat(path, st)) < 0)
 			git_error_set(GIT_ERROR_CHECKOUT, "could not stat symlink %s", path);
 
@@ -1630,6 +1703,7 @@ static int checkout_update_index(
 	git_index_entry__init_from_stat(&entry, st, true);
 	git_oid_cpy(&entry.id, &file->id);
 
+	// todo: add mutex
 	return git_index_add(data->index, &entry);
 }
 
@@ -1646,8 +1720,11 @@ static int checkout_submodule_update_index(
 
 	if (checkout_target_fullpath(&fullpath, data, file->path) < 0)
 		return -1;
-
+	#if ASYNC_CHECKOUT
+	git_atomic_ssize_add((git_atomic_ssize*)&data->perfdata.stat_calls, 1);
+	#else
 	data->perfdata.stat_calls++;
+	#endif
 	if (p_stat(fullpath->ptr, &st) < 0) {
 		git_error_set(
 			GIT_ERROR_CHECKOUT, "could not stat submodule %s\n", file->path);
@@ -1714,9 +1791,11 @@ static int checkout_safe_for_update_only(
 	checkout_data *data, const char *path, mode_t expected_mode)
 {
 	struct stat st;
-
+	#if ASYNC_CHECKOUT
+	git_atomic_ssize_add((git_atomic_ssize*)&data->perfdata.stat_calls, 1);
+	#else
 	data->perfdata.stat_calls++;
-
+	#endif
 	if (p_lstat(path, &st) < 0) {
 		/* if doesn't exist, then no error and no update */
 		if (errno == ENOENT || errno == ENOTDIR)
@@ -1744,7 +1823,7 @@ static int checkout_write_content(
 {
 	int error = 0;
 	git_blob *blob;
-
+	// thread safe
 	if ((error = git_blob_lookup(&blob, data->repo, oid)) < 0)
 		return error;
 
@@ -1769,6 +1848,173 @@ static int checkout_write_content(
 	return error;
 }
 
+#if ASYNC_CHECKOUT
+static int prefilter_blob(checkout_data *data, const git_diff_file *file, checkout_item* item)
+{
+	int error = 0;
+	git_blob *blob = NULL;
+	git_filter_list *fl = NULL;
+	git_filter_session filter_session = GIT_FILTER_SESSION_INIT;
+	// thread safe
+	if ((error = git_blob_lookup(&blob, data->repo, &file->id)) < 0)
+		goto cleanup;
+
+	if (!S_ISLNK(file->mode)) {
+		if (!data->opts.disable_filters &&
+		    (error = git_filter_list__load(
+		             &fl, data->repo, blob, file->path,
+		             GIT_FILTER_TO_WORKTREE, &filter_session))) {
+		    goto cleanup;
+		}
+		item->filters = fl;
+	}
+cleanup:
+	if (blob) {
+    	git_blob_free(blob);
+	}
+
+	return error;
+}
+
+static int parallel_checkout_blob(size_t count, checkout_item* item, checkout_data *data);
+
+// Not thread safe
+static int checkout_blob_file_sync(
+	checkout_data *data,
+	const git_diff_file *file,
+    const checkout_item* item
+)
+{
+	git_str fullpath;
+	struct stat st;
+	int error = 0;
+	git_blob *blob = NULL;
+	// thread safe
+	if (checkout_target_fullpath_safe(&fullpath, data, file->path) < 0) {
+	    error = -1;
+	    goto cleanup;
+	}
+	// thread safe
+	if ((data->strategy & GIT_CHECKOUT_UPDATE_ONLY) != 0) {
+		int rval = checkout_safe_for_update_only(
+			data, fullpath.ptr, file->mode);
+
+		if (rval <= 0) {
+			error = rval;
+		    goto cleanup;
+		}
+	}
+
+// ~ begin checkout_write_content
+	// thread safe
+	if ((error = git_blob_lookup(&blob, data->repo, &file->id)) < 0)
+	    goto cleanup;
+
+	// not thread safe
+	if ((error = mkpath2file(data, fullpath.ptr, data->opts.dir_mode)) < 0)
+		goto cleanup;
+
+	{
+		// 	error = blob_content_to_file(data, &st, blob, fullpath->ptr, file->path, file->mode);
+		int flags = data->opts.file_open_flags;
+		mode_t file_mode = data->opts.file_mode ? data->opts.file_mode : file->mode;
+		struct checkout_stream writer;
+		mode_t mode;
+		int fd;
+		
+		if (flags <= 0)
+			flags = O_CREAT | O_TRUNC | O_WRONLY;
+		if (!(mode = file_mode))
+			mode = GIT_FILEMODE_BLOB;
+
+		if ((fd = p_open(fullpath.ptr, flags, mode)) < 0) {
+			git_error_set(GIT_ERROR_OS, "could not open '%s' for writing", fullpath.ptr);
+			error = fd;
+		    goto cleanup;
+		}
+#if 0
+		if (!data->opts.disable_filters &&
+		// not thread safe, with lock
+			(error = git_filter_list__load(
+				&fl, data->repo, blob, file->path,
+				GIT_FILTER_TO_WORKTREE, &filter_session))) {
+			p_close(fd);
+			return error;
+		}
+#endif
+
+		/* setup the writer */
+		memset(&writer, 0, sizeof(struct checkout_stream));
+		writer.base.write = checkout_stream_write;
+		writer.base.close = checkout_stream_close;
+		writer.base.free = checkout_stream_free;
+		writer.path = fullpath.ptr;
+		writer.fd = fd;
+		writer.open = 1;
+
+		error = git_filter_list_stream_blob(item->filters, blob, &writer.base);
+
+		GIT_ASSERT(writer.open == 0);
+
+		// thread safe
+		git_filter_list_free(item->filters);
+
+		if (error < 0) {
+		    goto cleanup;
+		}
+
+		// not thread safe
+		#if ASYNC_CHECKOUT
+		git_atomic_ssize_add((git_atomic_ssize*)&data->perfdata.stat_calls, 1);
+		#else
+		data->perfdata.stat_calls++;
+		#endif
+
+		if ((error = p_stat(fullpath.ptr, &st)) < 0) {
+			git_error_set(GIT_ERROR_OS, "failed to stat '%s'", fullpath.ptr);
+			return error;
+		}
+		st.st_mode = file->mode;
+	}
+// ~ blob_content_to_file
+
+	/* if we try to create the blob and an existing directory blocks it from
+	 * being written, then there must have been a typechange conflict in a
+	 * parent directory - suppress the error and try to continue.
+	 */
+	if ((data->strategy & GIT_CHECKOUT_ALLOW_CONFLICTS) != 0 &&
+		(error == GIT_ENOTFOUND || error == GIT_EEXISTS))
+	{
+		git_error_clear();
+		error = 0;
+	}
+
+// ~ end checkout_write_content
+
+	/* update the index unless prevented */
+	if (!error && (data->strategy & GIT_CHECKOUT_DONT_UPDATE_INDEX) == 0)
+	{
+		git_mutex_lock(&data->index_mutex);
+		error = checkout_update_index(data, file, &st);
+		git_mutex_unlock(&data->index_mutex);
+	}
+
+	/* update the submodule data if this was a new .gitmodules file */
+	if (!error && strcmp(file->path, ".gitmodules") == 0) {   
+		git_mutex_lock(&data->index_mutex);
+		data->reload_submodules = true;
+		git_mutex_unlock(&data->index_mutex);
+	}
+cleanup:
+	if (blob) {
+	    git_blob_free(blob);
+	}
+	git_str_dispose(&fullpath);
+
+	return error;
+}
+#endif
+
 static int checkout_blob(
 	checkout_data *data,
 	const git_diff_file *file)
@@ -1776,10 +2022,10 @@ static int checkout_blob(
 	git_str *fullpath;
 	struct stat st;
 	int error = 0;
-
+	// not thread safe
 	if (checkout_target_fullpath(&fullpath, data, file->path) < 0)
 		return -1;
-
+	// thread safe
 	if ((data->strategy & GIT_CHECKOUT_UPDATE_ONLY) != 0) {
 		int rval = checkout_safe_for_update_only(
 			data, fullpath->ptr, file->mode);
@@ -1798,6 +2044,10 @@ static int checkout_blob(
 	/* update the submodule data if this was a new .gitmodules file */
 	if (!error && strcmp(file->path, ".gitmodules") == 0)
 		data->reload_submodules = true;
+
+	if (!error && strcmp(file->path, ".gitattributes") == 0) {
+		data->attr_checked = true;
+    }
 
 	return error;
 }
@@ -1861,20 +2111,219 @@ static int checkout_remove_the_old(
 	return 0;
 }
 
+#if ASYNC_CHECKOUT
+static void* on_checkout_file(void* arg) {
+	checkout_task* task = (checkout_task*)arg;
+	for (size_t i = task->start; i < task->end; i++) {
+		git_diff_delta *delta = access_delta(task->data, task->items[i].index);
+		task->error = checkout_blob_file_sync(task->data, &delta->new_file, &task->items[i]);
+		if (task->error < 0) {
+		    git_error_state_capture(&task->err, task->error);
+			break;
+		}
+	    // set succeed index
+		task->succeed = (int)i;
+	}
+	return NULL;
+}
+
+typedef struct checkout_single_file_result {
+    int error;
+    git_error_state err;
+    git_diff_delta *delta;
+} checkout_single_file_result;
+
+static void* on_checkout_single_file(void* arg) {
+	checkout_item* task = (checkout_item*)arg;
+	git_diff_delta *delta = access_delta(task->data, task->index);
+	checkout_single_file_result* result = git__calloc(1, sizeof(checkout_single_file_result));
+	result->delta = delta;
+	result->error = checkout_blob_file_sync(task->data, &delta->new_file, task);
+	if (result->error < 0) {
+	    git_error_state_capture(&result->err, result->error);
+	}
+	return result;
+}
+
+int parallel_checkout_blob(size_t count, checkout_item* item, checkout_data *data)
+{
+	int error = 0;
+	int num_workers = git__online_cpus();
+	if (data->opts.num_workers > 0 && data->opts.num_workers < num_workers) {
+		num_workers = data->opts.num_workers;
+	}
+#define USE_WORKER_POOL
+	workerpool* pool = init_workerpool(num_workers);
+#ifdef USE_WORKER_POOL
+	for (int iid = 0; iid < count; iid++)
+	{
+	    workerpool_enqueue(pool, on_checkout_single_file, item + iid);
+	}
+    while (count > 0) {
+	    finished_data* finished = workerpool_poll(pool);
+	    if (finished) {
+		    count--;
+		    checkout_single_file_result* result = finished->result;
+			if (result->error >= 0) {
+				data->completed_steps++;
+				report_progress(data, result->delta->new_file.path);
+			} else {
+				error = result->error;
+				git_error_set_str(error, result->err.error_msg.message);
+				git_error_state_free(&result->err);
+			}
+			git__free(result);
+		    free_finished_data(finished);
+	    }
+    }
+    wait_workerpool(pool);
+    close_workerpool(pool);
+    if (error < 0)
+	    return error;
+#else
+	git_diff_delta *delta;
+	size_t i;
+	int per_cpu_checks = count / num_workers;
+	int tail_checks = count % num_workers;
+	if (count > 0)
+	{
+		if (per_cpu_checks > 0) {
+			checkout_task *tasks = git__calloc(num_workers, sizeof(checkout_task));
+			for (size_t t = 0; t < num_workers; t++) {
+				tasks[t].start = t * per_cpu_checks;
+				tasks[t].end = (t + 1) * per_cpu_checks;
+				tasks[t].error = 0;
+				tasks[t].succeed = -1;// uninitialized
+				tasks[t].items = item;
+				tasks[t].data = data;
+				// adjust last one
+				if (t == num_workers - 1) {
+					tasks[t].end += tail_checks;
+				}
+				git_thread_create(&tasks[t].thread, on_checkout_file, tasks + t);
+			}
+
+			int error = 0;
+			// join
+			for (size_t t = 0; t < num_workers; t++) {
+				git_thread_join(&tasks[t].thread, NULL);
+				for (size_t s = tasks[t].start; s <= tasks[t].succeed; s++) {
+					if (tasks[t].error >= 0) {
+						data->completed_steps++;
+						delta = access_delta(data, item[s].index);
+						report_progress(data, delta->new_file.path);
+					} else {
+						error = tasks[t].error;
+						git_error_set_str(error, tasks[t].err.error_msg.message);
+						git_error_state_free(&tasks[t].err);
+					}
+				}
+			}
+			git__free(tasks);
+			if (error < 0) {
+				return error;
+			}
+		} else { // no need to parallel
+			for (size_t s = 0; s < count; s++) {
+				delta = access_delta(data, item[s].index);
+				if ((error = checkout_blob( data, &delta->new_file)) < 0)
+					return error;
+				data->completed_steps++;
+				report_progress(data, delta->new_file.path);
+			}
+		}
+	}
+#endif
+	return error;
+}
+#endif
+
 static int checkout_create_the_new(
 	unsigned int *actions,
 	checkout_data *data)
 {
+	checkout_filter* cflt = NULL;
 	int error = 0;
 	git_diff_delta *delta;
 	size_t i;
-
+#if ASYNC_CHECKOUT
+	bool switch_parallel = false;
 	git_vector_foreach(&data->diff->deltas, i, delta) {
 		if (actions[i] & CHECKOUT_ACTION__UPDATE_BLOB && !S_ISLNK(delta->new_file.mode)) {
 			if ((error = checkout_blob(data, &delta->new_file)) < 0)
 				return error;
 			data->completed_steps++;
 			report_progress(data, delta->new_file.path);
+			if (data->attr_checked) {
+				switch_parallel = true;
+				i++;
+				break;
+			}
+		}
+	}
+
+	if (switch_parallel) {
+	    git_str_truncate(&data->target_path, data->target_len);
+	    // sequently prefilering
+		size_t s = 0;
+	    size_t count = 0;
+		git_vector_foreach_start(i, &data->diff->deltas, s, delta)
+	    {
+		    if (actions[s] & CHECKOUT_ACTION__UPDATE_BLOB && !S_ISLNK(delta->new_file.mode)) {
+			    count++;
+		    }
+	    }
+	    checkout_item *items = (checkout_item *)git__calloc(count, sizeof(checkout_item));
+	    count = 0;
+	    git_vector_foreach_start(i, &data->diff->deltas, s, delta)
+	    {
+		    if (actions[s] & CHECKOUT_ACTION__UPDATE_BLOB && !S_ISLNK(delta->new_file.mode)) {
+			    items[count].index = s;
+			    items[count].data = data;
+			    count++;
+		    }
+	    }
+
+	    // prefiltering blobs
+	    for (size_t id = 0; id < count; id++) {
+		    delta = access_delta(data, items[id].index);
+		    // For git lfs, get object hash and size here
+		    if ((error = prefilter_blob(data, &delta->new_file, items + id)) < 0) {
+			    git__free(items);
+			    return error;
+		    }
+	    }
+	    // filter batch operation
+	    // For git lfs, send batch download url request here
+	    git_filter_list__global_sync_begin();
+
+	    // parallel checkout
+	    // For git lfs, download files in [cpu cores] thread
+	    parallel_checkout_blob(count, items, data);
+
+	    // end sync
+	    git_filter_list__global_sync_end();
+	    git__free(items);
+	}
+
+	git_vector_foreach(&data->diff->deltas, i, delta) {
+		if (actions[i] & CHECKOUT_ACTION__UPDATE_BLOB && S_ISLNK(delta->new_file.mode)) {
+			if ((error = checkout_blob(data, &delta->new_file)) < 0)
+				return error;
+			data->completed_steps++;
+			report_progress(data, delta->new_file.path);
+		}
+	}
+#else
+	git_vector_foreach(&data->diff->deltas, i, delta) {
+		if (actions[i] & CHECKOUT_ACTION__UPDATE_BLOB && !S_ISLNK(delta->new_file.mode)) {
+			error = checkout_blob(data, &delta->new_file);
+			if (error < 0 && error != GIT_DELAYED_STREAM)
+				return error;
+			if (error >= 0) {
+				data->completed_steps++;
+				report_progress(data, delta->new_file.path);
+			}
 		}
 	}
 
@@ -1886,8 +2335,9 @@ static int checkout_create_the_new(
 			report_progress(data, delta->new_file.path);
 		}
 	}
+#endif
 
-	return 0;
+	return error;
 }
 
 static int checkout_create_submodules(
@@ -2334,6 +2784,18 @@ static void checkout_data_clear(checkout_data *data)
 	git_strmap_free(data->mkdir_map);
 	data->mkdir_map = NULL;
 
+	if (data->dir_map_pool_mutex_inited)
+	{
+		git_mutex_free(&data->dir_map_pool_mutex);
+		data->dir_map_pool_mutex_inited = 0;
+	}
+
+	if (data->index_mutex_inited)
+	{
+		git_mutex_free(&data->index_mutex);
+		data->index_mutex_inited = 0;
+	}
+
 	git_attr_session__free(&data->attr_session);
 }
 
@@ -2514,8 +2976,13 @@ static int checkout_data_init(
 	    (error = git_vector_init(&data->update_conflicts, 0, NULL)) < 0 ||
 	    (error = git_str_puts(&data->target_path, data->opts.target_directory)) < 0 ||
 	    (error = git_fs_path_to_dir(&data->target_path)) < 0 ||
-	    (error = git_strmap_new(&data->mkdir_map)) < 0)
+	    (error = git_strmap_new(&data->mkdir_map)) < 0 ||
+		(error = git_mutex_init(&data->dir_map_pool_mutex)) < 0 ||
+		(error = git_mutex_init(&data->index_mutex)) < 0)
 		goto cleanup;
+
+	data->dir_map_pool_mutex_inited = 1;
+	data->index_mutex_inited = 1;
 
 	data->target_len = git_str_len(&data->target_path);
 
@@ -2665,7 +3132,12 @@ int git_checkout_iterator(
 		(error = checkout_extensions_update_index(&data)) < 0)
 		goto cleanup;
 
+	if (data.completed_steps != data.total_steps)
+	{
+		printf(" completed %d, total: %d", data.completed_steps, data.total_steps);
+	}
 	GIT_ASSERT(data.completed_steps == data.total_steps);
+
 
 	if (data.opts.perfdata_cb)
 		data.opts.perfdata_cb(&data.perfdata, data.opts.perfdata_payload);

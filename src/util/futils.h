@@ -111,6 +111,7 @@ struct git_futils_mkdir_options
 {
 	git_strmap *dir_map;
 	git_pool *pool;
+	git_mutex* mutex;
 	struct git_futils_mkdir_perfdata perfdata;
 };
 

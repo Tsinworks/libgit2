@@ -152,6 +152,9 @@ typedef int GIT_CALLBACK(git_filter_init_fn)(git_filter *self);
  */
 typedef void GIT_CALLBACK(git_filter_shutdown_fn)(git_filter *self);
 
+
+typedef void GIT_CALLBACK(git_filter_sync_fn)(git_filter *self);
+
 /**
  * Callback to decide if a given source needs this filter
  *
@@ -177,6 +180,14 @@ typedef int GIT_CALLBACK(git_filter_check_fn)(
 	void                   **payload, /* NULL on entry, may be set */
 	const git_filter_source *src,
 	const char             **attr_values);
+
+
+typedef int GIT_CALLBACK(git_filter_prefilter_fn)(
+        git_filter *self,
+        void **payload, /* NULL on entry, may be set */
+        const git_filter_source *src,
+	    const git_blob* blob,
+        const char **attr_values);
 
 #ifndef GIT_DEPRECATE_HARD
 /**
@@ -230,6 +241,20 @@ typedef void GIT_CALLBACK(git_filter_cleanup_fn)(
 	git_filter              *self,
 	void                    *payload);
 
+
+/**
+ * Callback to perform the delayed data filtering.
+ *
+ * Specified as `filter.stream`, this is a callback that filters data
+ * in a streaming manner.  This function will provide a
+ * `git_writestream` that will the original data will be written to;
+ * with that data, the `git_writestream` will then perform the filter
+ * translation and stream the filtered data out to the `next` location.
+ */
+typedef int GIT_CALLBACK(git_delayed_stream_fn)(
+	git_filter              *self,
+	void                    *payload);
+
 /**
  * Filter structure used to register custom filters.
  *
@@ -259,6 +284,9 @@ struct git_filter {
 	/** Called when the filter is removed or unregistered from the system. */
 	git_filter_shutdown_fn shutdown;
 
+	git_filter_sync_fn	   begin_sync;
+	git_filter_sync_fn	   end_sync;
+
 	/**
 	 * Called to determine whether the filter should be invoked for a
 	 * given file.  If this function returns `GIT_PASSTHROUGH` then the
@@ -266,6 +294,7 @@ struct git_filter {
 	 * contents will be passed through unmodified.
 	 */
 	git_filter_check_fn    check;
+	git_filter_prefilter_fn pre_filter;
 
 #ifdef GIT_DEPRECATE_HARD
 	void *reserved;

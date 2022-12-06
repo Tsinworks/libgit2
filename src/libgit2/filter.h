@@ -36,6 +36,9 @@ extern int git_filter_list__load(
 	git_filter_mode_t mode,
 	git_filter_session *filter_session);
 
+extern int git_filter_list__global_sync_begin();
+extern int git_filter_list__global_sync_end();
+
 int git_filter_list__apply_to_buffer(
 	git_str *out,
 	git_filter_list *filters,

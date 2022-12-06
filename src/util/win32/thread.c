@@ -153,6 +153,17 @@ int git_cond_init(git_cond *cond)
 	return *cond ? 0 : ENOMEM;
 }
 
+int git_cond_init2(git_cond *cond)
+{
+	/* This is an auto-reset event. */
+	*cond = CreateEventW(NULL, TRUE, FALSE, NULL);
+	GIT_ASSERT(*cond);
+
+	/* If we can't create the event, claim that the reason was out-of-memory.
+	 * The actual reason can be fetched with GetLastError(). */
+	return *cond ? 0 : ENOMEM;
+}
+
 int git_cond_free(git_cond *cond)
 {
 	BOOL closed;
@@ -201,6 +212,11 @@ int git_cond_signal(git_cond *cond)
 	GIT_UNUSED(signaled);
 
 	return 0;
+}
+
+int git_cond_broadcast(git_cond *cond)
+{
+	return git_cond_signal(cond);
 }
 
 int git_rwlock_init(git_rwlock *GIT_RESTRICT lock)

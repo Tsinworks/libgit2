@@ -49,10 +49,14 @@ int git_mutex_free(git_mutex *);
 int git_mutex_lock(git_mutex *);
 int git_mutex_unlock(git_mutex *);
 
+// auto reset condition
 int git_cond_init(git_cond *);
+// manual reset condition
+int git_cond_init2(git_cond *);
 int git_cond_free(git_cond *);
 int git_cond_wait(git_cond *, git_mutex *);
 int git_cond_signal(git_cond *);
+int git_cond_broadcast(git_cond *);
 
 int git_rwlock_init(git_rwlock *GIT_RESTRICT lock);
 int git_rwlock_rdlock(git_rwlock *);

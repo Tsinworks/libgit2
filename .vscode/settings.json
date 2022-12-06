@@ -1,0 +1,20 @@
+{
+    "clangd.fallbackFlags": [
+        "-x", "c",
+        "-I", "D:/vcpkg-2022.10.19/packages/zlib_x64-windows/include",
+        "-I", "deps/pcre",
+        "-I", "src/util",
+        "-I", "include",
+        "-I", "src/libgit2",
+        "-I", "deps/http-parser",
+        "-D", "WIN32",
+        "-D", "_WIN32_WINNT=0x0600",
+        "-D", "STRSAFE_NO_DEPRECATE",
+        "-D", "GIT_THREADS=1",
+        "-D", "GIT_SSH=1",
+        "-D", "GIT_WINHTTP=1",
+        "-D", "GIT_WIN32=1",
+        "-D", "_MSC_VER=1913",
+        "-D", "GIT_REGEX_BUILTIN"
+    ]
+}

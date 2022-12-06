@@ -413,7 +413,7 @@ GIT_INLINE(int) mkdir_validate_dir(
 			return GIT_EEXISTS;
 		}
 
-		opts->perfdata.mkdir_calls++;
+		git_atomic_ssize_add((git_atomic_ssize*)&opts->perfdata.mkdir_calls, 1);
 
 		if (p_mkdir(path, mode) < 0) {
 			git_error_set(GIT_ERROR_OS, "failed to make directory '%s'", path);
@@ -423,7 +423,7 @@ GIT_INLINE(int) mkdir_validate_dir(
 
 	else if (S_ISLNK(st->st_mode)) {
 		/* Re-stat the target, make sure it's a directory */
-		opts->perfdata.stat_calls++;
+		git_atomic_ssize_add((git_atomic_ssize*)&opts->perfdata.stat_calls, 1);
 
 		if (p_stat(path, st) < 0) {
 			git_error_set(GIT_ERROR_OS, "failed to make directory '%s'", path);
@@ -451,7 +451,7 @@ GIT_INLINE(int) mkdir_validate_mode(
 	if (((terminal_path && (flags & GIT_MKDIR_CHMOD) != 0) ||
 		(flags & GIT_MKDIR_CHMOD_PATH) != 0) && st->st_mode != mode) {
 
-		opts->perfdata.chmod_calls++;
+		git_atomic_ssize_add((git_atomic_ssize*)&opts->perfdata.chmod_calls, 1);
 
 		if (p_chmod(path, mode) < 0) {
 			git_error_set(GIT_ERROR_OS, "failed to set permissions on '%s'", path);
@@ -596,6 +596,9 @@ int git_futils_mkdir_r(const char *path, const mode_t mode)
 	return git_futils_mkdir(path, mode, GIT_MKDIR_PATH);
 }
 
+#define MUTEX_LOCK(mutex) if (mutex) { git_mutex_lock(mutex); }
+#define MUTEX_UNLOCK(mutex) if (mutex) { git_mutex_unlock(mutex); }
+
 int git_futils_mkdir_relative(
 	const char *relative_path,
 	const char *base,
@@ -653,11 +656,16 @@ int git_futils_mkdir_relative(
 		*tail = '\0';
 		st.st_mode = 0;
 
+		MUTEX_LOCK(opts->mutex);
 		if (opts->dir_map && git_strmap_exists(opts->dir_map, make_path.ptr))
+		{
+			MUTEX_UNLOCK(opts->mutex);
 			continue;
+		}
+		MUTEX_UNLOCK(opts->mutex);
 
 		/* See what's going on with this path component */
-		opts->perfdata.stat_calls++;
+		git_atomic_ssize_add((git_atomic_ssize*)&opts->perfdata.stat_calls, 1);
 
 retry_lstat:
 		if (p_lstat(make_path.ptr, &st) < 0) {
@@ -668,7 +676,7 @@ retry_lstat:
 			}
 
 			git_error_clear();
-			opts->perfdata.mkdir_calls++;
+			git_atomic_ssize_add((git_atomic_ssize*)&opts->perfdata.mkdir_calls, 1);
 			mkdir_attempted = true;
 			if (p_mkdir(make_path.ptr, mode) < 0) {
 				if (errno == EEXIST)
@@ -692,6 +700,7 @@ retry_lstat:
 			char *cache_path;
 			size_t alloc_size;
 
+			MUTEX_LOCK(opts->mutex);
 			GIT_ERROR_CHECK_ALLOC_ADD(&alloc_size, make_path.size, 1);
 			cache_path = git_pool_malloc(opts->pool, alloc_size);
 			GIT_ERROR_CHECK_ALLOC(cache_path);
@@ -699,7 +708,12 @@ retry_lstat:
 			memcpy(cache_path, make_path.ptr, make_path.size + 1);
 
 			if ((error = git_strmap_set(opts->dir_map, cache_path, cache_path)) < 0)
+			{
+				MUTEX_UNLOCK(opts->mutex);
 				goto done;
+			}
+
+			MUTEX_UNLOCK(opts->mutex);
 		}
 	}
 
@@ -708,7 +722,7 @@ retry_lstat:
 	/* check that full path really is a directory if requested & needed */
 	if ((flags & GIT_MKDIR_VERIFY_DIR) != 0 &&
 		lastch != '\0') {
-		opts->perfdata.stat_calls++;
+		git_atomic_ssize_add((git_atomic_ssize*)&opts->perfdata.stat_calls, 1);
 
 		if (p_stat(make_path.ptr, &st) < 0 || !S_ISDIR(st.st_mode)) {
 			git_error_set(GIT_ERROR_OS, "path is not a directory '%s'",

@@ -220,6 +220,40 @@ done:
 	return error;
 }
 
+int git_filter_list__global_sync_begin()
+{
+	size_t pos;
+	git_filter_def *fdef;
+
+	if (git_rwlock_wrlock(&filter_registry.lock) < 0)
+		return -1;
+
+	git_vector_foreach (&filter_registry.filters, pos, fdef) {
+		if (fdef->initialized && fdef->filter && fdef->filter->begin_sync) {
+			fdef->filter->begin_sync(fdef->filter);
+		}
+	}
+	git_rwlock_wrunlock(&filter_registry.lock);
+	return 0;
+}
+
+int git_filter_list__global_sync_end()
+{
+	size_t pos;
+	git_filter_def *fdef;
+
+	if (git_rwlock_wrlock(&filter_registry.lock) < 0)
+		return -1;
+
+	git_vector_foreach (&filter_registry.filters, pos, fdef) {
+		if (fdef->initialized && fdef->filter && fdef->filter->end_sync) {
+			fdef->filter->end_sync(fdef->filter);
+		}
+	}
+	git_rwlock_wrunlock(&filter_registry.lock);
+	return 0;
+}
+
 static void git_filter_global_shutdown(void)
 {
 	size_t pos;
@@ -558,10 +592,14 @@ int git_filter_list__load(
 		if (!fdef->initialized && (error = filter_initialize(fdef)) < 0)
 			break;
 
-		if (fdef->filter->check)
-			error = fdef->filter->check(
+		if (fdef->filter->pre_filter && blob) {
+		    error = fdef->filter->pre_filter(
+				fdef->filter, &payload, &src, blob, values);
+		} else if (fdef->filter->check) {
+		    error = fdef->filter->check(
 				fdef->filter, &payload, &src, values);
-
+		}
+		
 		git__free((void *)values);
 
 		if (error == GIT_PASSTHROUGH)

@@ -289,6 +289,13 @@ typedef struct git_checkout_options {
 	unsigned int file_mode; /**< default is 0644 or 0755 as dictated by blob */
 	int file_open_flags;    /**< default is O_CREAT | O_TRUNC | O_WRONLY */
 
+	int num_workers;	    /**< default is 0, use single thread checkout, -1 means all cpu cores, num_workers can be set between 0 ~ max cpu cores,
+							 *   if exceeded max cpu cores, num of workers will be clamp to max cpu core */
+	int enable_lfs;		    /**< default is 0, disable lfs checkout support */
+	int lfs_timeout;	    /**< default is 0, lfs download timeout in seconds */
+	int lfs_connections;	/**< default is 0, max number of lfs connections is 80 */
+	int lfs_retry;		    /**< default is 0, defines how many times to download lfs files */
+
 	unsigned int notify_flags; /**< see `git_checkout_notify_t` above */
 
 	/**

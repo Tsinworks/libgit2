@@ -79,6 +79,11 @@ GIT_INLINE(void *) git_vector_last(const git_vector *v)
 #define git_vector_foreach(v, iter, elem)	\
 	for ((iter) = 0; (iter) < (v)->length && ((elem) = (v)->contents[(iter)], 1); (iter)++ )
 
+#define git_vector_foreach_start(s, v, iter, elem)                                 \
+	for ((iter) = s;                                                  \
+	     (iter) < (v)->length && ((elem) = (v)->contents[(iter)], 1); \
+	     (iter)++)
+
 #define git_vector_rforeach(v, iter, elem)	\
 	for ((iter) = (v)->length - 1; (iter) < SIZE_MAX && ((elem) = (v)->contents[(iter)], 1); (iter)-- )
 

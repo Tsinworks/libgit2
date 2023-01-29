@@ -377,7 +377,8 @@ static bool should_checkout(
 	return !git_repository_head_unborn(repo);
 }
 
-static int checkout_branch(git_repository *repo, git_remote *remote, const git_checkout_options *co_opts, const char *branch, const char *reflog_message)
+static int checkout_branch(git_repository *repo, git_remote *remote, const git_checkout_options *co_opts,
+	const git_fetch_options *fe_opts, const char *branch, const char *reflog_message)
 {
 	int error;
 
@@ -419,7 +420,7 @@ static int clone_into(git_repository *repo, git_remote *_remote, const git_fetch
 	if ((error = git_remote_fetch(remote, NULL, &fetch_opts, git_str_cstr(&reflog_message))) != 0)
 		goto cleanup;
 
-	error = checkout_branch(repo, remote, co_opts, branch, git_str_cstr(&reflog_message));
+	error = checkout_branch(repo, remote, co_opts, opts, branch, git_str_cstr(&reflog_message));
 
 cleanup:
 	git_remote_free(remote);
@@ -647,7 +648,7 @@ static int clone_local_into(git_repository *repo, git_remote *remote, const git_
 	if ((error = git_remote_fetch(remote, NULL, fetch_opts, git_str_cstr(&reflog_message))) != 0)
 		goto cleanup;
 
-	error = checkout_branch(repo, remote, co_opts, branch, git_str_cstr(&reflog_message));
+	error = checkout_branch(repo, remote, co_opts, fetch_opts, branch, git_str_cstr(&reflog_message));
 
 cleanup:
 	git_str_dispose(&reflog_message);

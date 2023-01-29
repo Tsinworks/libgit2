@@ -349,6 +349,9 @@ typedef struct git_checkout_options {
 
 	/** Payload passed to perfdata_cb */
 	void *perfdata_payload;
+
+	/** Optional */
+	//const git_fetch_options *fetch_opts;
 } git_checkout_options;
 
 #define GIT_CHECKOUT_OPTIONS_VERSION 1

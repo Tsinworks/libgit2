@@ -4,6 +4,7 @@
 #include "str.h"
 #include "transports/auth_lfs.h"
 #include "git2/blob.h"
+#include "remote.h"
 
 #define MAX_JSON 4096
 
